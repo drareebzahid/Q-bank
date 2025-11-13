@@ -1,4 +1,8 @@
-// pages/api/questions/index.ts
+// pages/api/questions/index.ts   (temporary debugging endpoint)
+// DEBUGGING ONLY: returns non-sensitive diagnostics about the incoming request,
+// token verification, access_grants lookup, and question_versions lookup.
+// Remove this file or revert it after debugging.
+
 import type { NextApiRequest, NextApiResponse } from 'next';
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -20,69 +24,67 @@ function jsonHeader(apikey: string, token?: string) {
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    // Expect Authorization: Bearer <token>
     const authHeader = (req.headers.authorization || '').trim();
     const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
-    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    const token_prefix = token ? token.slice(0, 8) : null; // do not expose full token
 
-    // 1) verify token and get user via Supabase Auth REST
-    const authResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      method: 'GET',
-      headers: jsonHeader(SUPABASE_ANON_KEY, token),
-    });
-
-    if (!authResp.ok) {
-      const err = await authResp.text();
-      console.error('Auth verification failed', authResp.status, err);
-      return res.status(401).json({ error: 'Invalid token' });
+    // Step A: verify token via auth/v1/user
+    let authStatus = null, authJson = null;
+    if (token) {
+      const authResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+        method: 'GET',
+        headers: jsonHeader(SUPABASE_ANON_KEY, token),
+      });
+      authStatus = authResp.status;
+      try { authJson = await authResp.json(); } catch (e) { authJson = String(e); }
     }
 
-    const user = await authResp.json();
-    const uid = user?.id;
-    if (!uid) {
-      console.error('Auth response missing id', user);
-      return res.status(401).json({ error: 'Invalid token' });
+    // Step B: check access_grants via REST with the same token
+    let grantsStatus = null, grantsJson = null;
+    if (authJson && authJson.id) {
+      const uid = authJson.id;
+      const grantsUrl = `${SUPABASE_URL}/rest/v1/access_grants?user_id=eq.${uid}&active=eq.true`;
+      const grantsResp = await fetch(grantsUrl, {
+        method: 'GET',
+        headers: jsonHeader(SUPABASE_ANON_KEY, token || undefined),
+      });
+      grantsStatus = grantsResp.status;
+      try { grantsJson = await grantsResp.json(); } catch (e) { grantsJson = String(e); }
     }
 
-    // 2) check active access_grants for this user via REST (RLS will evaluate using Bearer token)
-    const grantsUrl = `${SUPABASE_URL}/rest/v1/access_grants?user_id=eq.${uid}&active=eq.true`;
-    const grantsResp = await fetch(grantsUrl, {
-      method: 'GET',
-      headers: jsonHeader(SUPABASE_ANON_KEY, token),
-    });
-
-    if (!grantsResp.ok) {
-      const err = await grantsResp.text();
-      console.error('access_grants fetch failed', grantsResp.status, err);
-      return res.status(500).json({ error: 'access_grants_query_failed' });
+    // Step C: fetch published question_versions (small sample)
+    let qvStatus = null, qvJson = null;
+    try {
+      const qvUrl = `${SUPABASE_URL}/rest/v1/question_versions?is_published=eq.true&order=published_at.desc&select=id,title,is_published,published_at&limit=5`;
+      const qvResp = await fetch(qvUrl, {
+        method: 'GET',
+        headers: jsonHeader(SUPABASE_ANON_KEY, token || undefined),
+      });
+      qvStatus = qvResp.status;
+      try { qvJson = await qvResp.json(); } catch (e) { qvJson = String(e); }
+    } catch (e) {
+      qvStatus = 'fetch_failed';
+      qvJson = String(e);
     }
 
-    const grants = await grantsResp.json();
-    if (!Array.isArray(grants) || grants.length === 0) {
-      return res.status(403).json({ error: 'No active access' });
-    }
+    // Build compact diagnostic response (no secret values)
+    const diag = {
+      token_present: !!token,
+      token_prefix,
+      auth_status: authStatus,
+      auth_user_id: authJson && authJson.id ? authJson.id : null,
+      auth_keys: authJson && typeof authJson === 'object' ? Object.keys(authJson).slice(0,10) : null,
+      grants_status: grantsStatus,
+      grants_count: Array.isArray(grantsJson) ? grantsJson.length : (grantsJson ? 1 : 0),
+      grants_sample: Array.isArray(grantsJson) ? grantsJson.map(g => ({ product_id: g.product_id, active: g.active })).slice(0,3) : null,
+      qv_status: qvStatus,
+      qv_count: Array.isArray(qvJson) ? qvJson.length : null,
+      qv_sample: Array.isArray(qvJson) ? qvJson : null
+    };
 
-    // 3) fetch published question_versions (limit and paging)
-    const page = parseInt((req.query.page as string) || '1', 10);
-    const limit = 20;
-    const offset = (page - 1) * limit;
-    // Supabase REST uses Range header or range query. We'll use limit & offset via query params (range not necessary).
-    const qvUrl = `${SUPABASE_URL}/rest/v1/question_versions?is_published=eq.true&order=published_at.desc&select=*`;
-    const qvResp = await fetch(qvUrl + `&limit=${limit}&offset=${offset}`, {
-      method: 'GET',
-      headers: jsonHeader(SUPABASE_ANON_KEY, token),
-    });
-
-    if (!qvResp.ok) {
-      const err = await qvResp.text();
-      console.error('question_versions fetch failed', qvResp.status, err);
-      return res.status(500).json({ error: 'question_versions_query_failed' });
-    }
-
-    const qvs = await qvResp.json();
-    return res.status(200).json({ questions: qvs });
+    return res.status(200).json({ debug: diag });
   } catch (err: any) {
-    console.error('student endpoint error', err);
+    console.error('debug endpoint error', err);
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 }

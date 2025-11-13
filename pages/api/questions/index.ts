@@ -17,18 +17,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     if (!token) return res.status(401).json({ error: 'Missing auth token' });
 
-    // Create a Supabase client scoped to this request and attach the user's JWT so RLS can use auth.uid()
-    const supabase = createClient(url, anon, {
-      auth: { persistSession: false },
-      global: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-    });
+    // IMPORTANT: create a Supabase client using the *user's token as the key*
+    // This ensures RLS sees auth.uid() and evaluates policies using this user's identity.
+    const supabase = createClient(url, token, { auth: { persistSession: false } });
 
     // Verify token and obtain user
-    const { data: userData, error: userErr } = await supabase.auth.getUser(token);
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
     if (userErr || !userData.user) return res.status(401).json({ error: 'Invalid token' });
 
     const uid = userData.user.id;

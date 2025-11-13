@@ -1,66 +1,85 @@
 // pages/api/questions/index.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { createClient } from '@supabase/supabase-js';
 
-const url = process.env.SUPABASE_URL!;
-const anon = process.env.SUPABASE_ANON_KEY!;
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY!;
 
-if (!url || !anon) {
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment');
+}
+
+function jsonHeader(apikey: string, token?: string) {
+  const headers: Record<string,string> = {
+    'apikey': apikey,
+    'Accept': 'application/json',
+    'Content-Type': 'application/json'
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    // Expect a Supabase access token in Authorization header: "Bearer <token>"
+    // Expect Authorization: Bearer <token>
     const authHeader = (req.headers.authorization || '').trim();
     const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
-
     if (!token) return res.status(401).json({ error: 'Missing auth token' });
 
-    // IMPORTANT: create a Supabase client using the *user's token as the key*
-    // This ensures RLS sees auth.uid() and evaluates policies using this user's identity.
-    const supabase = createClient(url, token, { auth: { persistSession: false } });
+    // 1) verify token and get user via Supabase Auth REST
+    const authResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: 'GET',
+      headers: jsonHeader(SUPABASE_ANON_KEY, token),
+    });
 
-    // Verify token and obtain user
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-    if (userErr || !userData.user) return res.status(401).json({ error: 'Invalid token' });
-
-    const uid = userData.user.id;
-
-    // Confirm active access_grant exists (this SELECT will run with the user's JWT, so RLS will apply correctly)
-    const { data: grants, error: gErr } = await supabase
-      .from('access_grants')
-      .select('*')
-      .eq('user_id', uid)
-      .eq('active', true);
-
-    if (gErr) {
-      console.error('access_grants query error', gErr);
-      throw gErr;
+    if (!authResp.ok) {
+      const err = await authResp.text();
+      console.error('Auth verification failed', authResp.status, err);
+      return res.status(401).json({ error: 'Invalid token' });
     }
 
-    if (!grants || grants.length === 0) {
+    const user = await authResp.json();
+    const uid = user?.id;
+    if (!uid) {
+      console.error('Auth response missing id', user);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // 2) check active access_grants for this user via REST (RLS will evaluate using Bearer token)
+    const grantsUrl = `${SUPABASE_URL}/rest/v1/access_grants?user_id=eq.${uid}&active=eq.true`;
+    const grantsResp = await fetch(grantsUrl, {
+      method: 'GET',
+      headers: jsonHeader(SUPABASE_ANON_KEY, token),
+    });
+
+    if (!grantsResp.ok) {
+      const err = await grantsResp.text();
+      console.error('access_grants fetch failed', grantsResp.status, err);
+      return res.status(500).json({ error: 'access_grants_query_failed' });
+    }
+
+    const grants = await grantsResp.json();
+    if (!Array.isArray(grants) || grants.length === 0) {
       return res.status(403).json({ error: 'No active access' });
     }
 
-    // Pagination params
+    // 3) fetch published question_versions (limit and paging)
     const page = parseInt((req.query.page as string) || '1', 10);
     const limit = 20;
     const offset = (page - 1) * limit;
+    // Supabase REST uses Range header or range query. We'll use limit & offset via query params (range not necessary).
+    const qvUrl = `${SUPABASE_URL}/rest/v1/question_versions?is_published=eq.true&order=published_at.desc&select=*`;
+    const qvResp = await fetch(qvUrl + `&limit=${limit}&offset=${offset}`, {
+      method: 'GET',
+      headers: jsonHeader(SUPABASE_ANON_KEY, token),
+    });
 
-    // Return published question versions (RLS + the user's grant now allow access)
-    const { data: qvs, error: qvErr } = await supabase
-      .from('question_versions')
-      .select('*')
-      .eq('is_published', true)
-      .order('published_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    if (qvErr) {
-      console.error('question_versions query error', qvErr);
-      throw qvErr;
+    if (!qvResp.ok) {
+      const err = await qvResp.text();
+      console.error('question_versions fetch failed', qvResp.status, err);
+      return res.status(500).json({ error: 'question_versions_query_failed' });
     }
 
+    const qvs = await qvResp.json();
     return res.status(200).json({ questions: qvs });
   } catch (err: any) {
     console.error('student endpoint error', err);

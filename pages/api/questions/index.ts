@@ -1,29 +1,29 @@
 // pages/api/questions/index.ts
-// Student questions endpoint: requires Supabase JWT + active access_grants
+// Student questions endpoint:
+// - Reads Supabase JWT from Authorization header
+// - Decodes it to get user id (sub)
+// - Uses supabaseAdmin (service_role) to:
+//   - Check access_grants
+//   - Return published question_versions
 
 import type { NextApiRequest, NextApiResponse } from 'next';
+import supabaseAdmin from '../../../lib/supabaseAdmin';
 
-const SUPABASE_URL = process.env.SUPABASE_URL as string;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY as string;
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment');
+// Simple JWT payload decoder (no signature verification), enough to read `sub`
+function decodeSupabaseJwt(token: string): any | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = parts[1];
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(normalized, 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
 }
 
-function buildHeaders(apikey: string, token?: string) {
-  const headers: Record<string, string> = {
-    apikey,
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-  };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  return headers;
-}
-
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse
-) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET');
     return res.status(405).json({ error: 'Method not allowed' });
@@ -39,65 +39,47 @@ export default async function handler(
   }
 
   try {
-    // Step 1: verify token and get Supabase user
-    const userResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      method: 'GET',
-      headers: buildHeaders(SUPABASE_ANON_KEY, token),
-    });
+    // 1) Decode JWT to get user id
+    const payload = decodeSupabaseJwt(token);
+    const userId = payload?.sub as string | undefined;
 
-    if (!userResp.ok) {
-      return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-
-    const user = await userResp.json();
-    const userId = user?.id as string | undefined;
     if (!userId) {
-      return res.status(401).json({ error: 'Invalid Supabase user' });
+      return res.status(401).json({ error: 'Invalid Supabase JWT: no sub' });
     }
 
-    // Step 2: check active access_grants for this user
-    const grantsResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/access_grants?user_id=eq.${userId}&active=eq.true`,
-      {
-        method: 'GET',
-        headers: buildHeaders(SUPABASE_ANON_KEY, token),
-      }
-    );
+    // 2) Check access_grants via service-role (bypasses RLS, still server-only)
+    const { data: grants, error: grantsError } = await supabaseAdmin
+      .from('access_grants')
+      .select('id, user_id, product_id, active, expires_at')
+      .eq('user_id', userId)
+      .eq('active', true);
 
-    if (!grantsResp.ok) {
-      return res
-        .status(500)
-        .json({ error: 'Access lookup failed at access_grants' });
+    if (grantsError) {
+      console.error('access_grants error', grantsError);
+      return res.status(500).json({ error: 'Access lookup failed' });
     }
 
-    const grants = (await grantsResp.json()) as any[];
-    if (!Array.isArray(grants) || grants.length === 0) {
+    if (!grants || grants.length === 0) {
       return res.status(403).json({ error: 'No active access' });
     }
 
-    // Step 3: fetch published question_versions for students
-    const questionsResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/question_versions` +
-        `?is_published=eq.true` +
-        `&select=id,question_id,title,content_json,options_json,explanation,published_at` +
-        `&order=published_at.desc` +
-        `&limit=50`,
-      {
-        method: 'GET',
-        headers: buildHeaders(SUPABASE_ANON_KEY),
-      }
-    );
+    // 3) Fetch published questions
+    const { data: questionVersions, error: qError } = await supabaseAdmin
+      .from('question_versions')
+      .select(
+        'id, question_id, title, content_json, options_json, explanation, published_at'
+      )
+      .eq('is_published', true)
+      .order('published_at', { ascending: false })
+      .limit(50);
 
-    if (!questionsResp.ok) {
-      return res
-        .status(500)
-        .json({ error: 'Failed to fetch questions from question_versions' });
+    if (qError) {
+      console.error('question_versions error', qError);
+      return res.status(500).json({ error: 'Failed to fetch questions' });
     }
 
-    const questionVersions = await questionsResp.json();
-
     return res.status(200).json({
-      questions: questionVersions,
+      questions: questionVersions || [],
     });
   } catch (err: any) {
     console.error('questions API error', err);

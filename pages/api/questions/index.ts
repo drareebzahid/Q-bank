@@ -7,7 +7,7 @@
 //   - Return published question_versions
 
 import type { NextApiRequest, NextApiResponse } from 'next';
-import supabaseAdmin from '../../../lib/supabaseAdmin';
+import { supabaseAdmin } from '../../../lib/supabaseAdmin';
 
 // Simple JWT payload decoder (no signature verification), enough to read `sub`
 function decodeSupabaseJwt(token: string): any | null {
